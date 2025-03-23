@@ -11,6 +11,7 @@ import numpy as np
 import seaborn as sns
 import MDAnalysis as mda
 import matplotlib.pyplot as plt
+import h5py
 
 from numba import jit
 from collections import defaultdict
@@ -45,7 +46,6 @@ from packages.constants import *
 # configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
 class ConfigParser:
     def __init__(self):
         """config arguments from command line"""
@@ -76,14 +76,15 @@ class ConfigParser:
                                  help='Choose whether to output the high-scoring results that have been filtered, default is 3.0.')
         self.parser.add_argument('--num_processes', type=int, default=None,
                                  help="Number of processes for parallel execution."
-                                  "If None, use all available CPU cores. Default is None.")
+                                      "If None, use all available CPU cores. Default is None.")
         self.parser.add_argument('--print_freq', type=int, default=1000,
                                  help="Print the elapsed time every N frames, default is 1000 frames.")
         self.parser.add_argument('--radius_min', type=float, default=3.23,
                                  help="Minimum distance threshold in Ångström, default is 3.23")
         self.parser.add_argument('--radius_max', type=float, default=4.63,
                                  help="Maximum distance threshold in Ångström, default is 4.63")
-
+        self.parser.add_argument('--save_hdf5', action='store_true',
+                                 help='Generate HDF5 file if specified (default: False).')
 
     def parse_arguments(self):
         """Parses command line arguments and returns them as a dictionary."""
@@ -93,7 +94,6 @@ class ConfigParser:
             sys.exit(1)
         args = self.parser.parse_args()
         return vars(args)
- 
 
 @timing_decorator
 class ResidueCombinePairs:
@@ -306,7 +306,7 @@ class UniverseInitializer:
         """
         self.basic['first_frame_time'] = self.basic['md_traj'].trajectory[0].time
         logging.info(f"The initial frame time of the trajectory is {self.basic['first_frame_time']} ps")
-        self.basic['last_frame_time'] = self.basic['md_traj'].trajectory[-1].time
+        self.basic['last_frame_time'] = self.__dict__['md_traj'].trajectory[-1].time
         logging.info(f"The final frame finaltime of the trajectory is {self.basic['last_frame_time']} ps")
         
         # Compute the time difference and divide by the number of intervals to get the mean time step
@@ -379,17 +379,18 @@ class UniverseInitializer:
 
 @timing_decorator
 class DataVisualizer:
-    def __init__(self, basic_settings, rrcs_data):
+    def __init__(self, basic_settings, times, all_frame_rrcs):
         """
-        Initializes the class with basic settings.
+        Initializes the class with basic settings, times, and RRCS data.
 
-        This constructor takes a dictionary of basic settings, most importantly 
-        the path to the output directory. If the output directory does not exist,
+        This constructor takes a dictionary of basic settings, a list of frame times,
+        and a list of RRCS data for each frame. If the output directory does not exist,
         it will be created.
 
         :param basic_settings: A dictionary containing basic settings, must include 
-                            the path to the output directory.
-               rrcs_data: A dictionary containing the RRCs data.
+                               the path to the output directory.
+        :param times: A list of frame times in picoseconds.
+        :param all_frame_rrcs: A list where each element is a list of (res1, res2, rrcs_score) tuples for a frame.
         """
         # Extract the output directory path from the basic settings
         self.output_dir = basic_settings['output_dir']
@@ -405,17 +406,19 @@ class DataVisualizer:
         self.output = os.path.join(self.output_dir, basic_settings['output_file'])
         # Save whether to generate plots from the settings
         self.isplot = basic_settings['plot']
-        self.rrcs_data = rrcs_data
+        self.times = times
+        self.all_frame_rrcs = all_frame_rrcs
+        self.basic_settings = basic_settings
         self.filter_threshold = basic_settings['filter_threshold']
 
     def write_output(self):
         """Writes the processed data to the output file."""
         # Initialize a list with the output file's header information.
-        outlines = [OUTPUT_HEADER]
-        filter_outlines = [OUTPUT_FILTER_HEADER]
+        outlines = [OUTPUT_HEADER.replace('Frame', 'Time (ps)')]  # Updated header
+        filter_outlines = [OUTPUT_FILTER_HEADER.replace('Frame', 'Time (ps)')]
 
         # Append the reformatted data lines.
-        lines, filter_lines = self.reformat_data_lines(self.rrcs_data)
+        lines, filter_lines = self.reformat_data_lines()
 
         outlines.extend(lines)
         with open(self.output, 'w') as f:
@@ -429,26 +432,25 @@ class DataVisualizer:
             f.writelines(filter_outlines)
         logging.info(f"Filtered RRCS data is saved to the {filepath} file.")
 
-    def reformat_data_lines(self, rrcs_data):
+    def reformat_data_lines(self):
         """
         Reformat data lines to create a uniform representation for each pair of residues and their corresponding 
         Relative Rotamer Conformation Score (RRCS).
         
-        This method starts by adding a header, then transforms the data within the rrcs_data dictionary into a 
-        standardized list format, and finally prints these data in a neat table format through the pretty_print_table 
-        method.
+        This method starts by adding a header, then transforms the data into a 
+        standardized list format using times and all_frame_rrcs, and finally prints these data in a neat table format.
         
         Returns:
-            Formatted data table, returned as a string.
+            Tuple of formatted data table and filtered data table, returned as strings.
         """
-        outlines = [('Frame', 'Residue1', 'Residue2', 'RRCS')]
-        filter_outlines = [('Frame', 'Residue1', 'Residue2', 'RRCS')]
-        for frame, rrcs_list in sorted(rrcs_data.items(), key=lambda x: x[0]):
-            # Iterate over the RRCS list, each entry is a tuple containing residue identifiers and an RRCS score
-            for res1, res2, rrcs_score in rrcs_list:
-                outlines.append((frame, res1, res2, rrcs_score))
+        outlines = [('Time (ps)', 'Residue1', 'Residue2', 'RRCS')]
+        filter_outlines = [('Time (ps)', 'Residue1', 'Residue2', 'RRCS')]
+        for i, frame_rrcs in enumerate(self.all_frame_rrcs):
+            time = self.times[i]
+            for res1, res2, rrcs_score in frame_rrcs:
+                outlines.append((time, res1, res2, rrcs_score))
                 if rrcs_score > self.filter_threshold:
-                    filter_outlines.append((frame, res1, res2, rrcs_score))
+                    filter_outlines.append((time, res1, res2, rrcs_score))
         outlines = self.pretty_print_table(outlines)
         filter_outlines = self.pretty_print_table(filter_outlines)
 
@@ -459,7 +461,6 @@ class DataVisualizer:
         Prints a table in a pretty format with specified column widths.
         
         :param rows: A list of lists where each inner list represents a row in the table.
-        :param output_offset: An integer representing the offset to add to each column's width.
         :return: A string representation of the formatted table.
         """
         # Calculate column widths
@@ -475,19 +476,19 @@ class DataVisualizer:
         """
         Plots an RRCS Scatter Diagram.
 
-        Reformats data from self.rrcs_data and creates a scatter plot using the seaborn library.
-        The scatter plot represents RRCS values for each frame, aiding in analyzing trends in RRCS values.
+        Reformats data from self.all_frame_rrcs and creates a scatter plot using the seaborn library.
+        The scatter plot represents RRCS values over time, aiding in analyzing trends in RRCS values.
 
         The filename is derived from self.output and the plot is saved in PNG format.
         """
         # Reformatted scatter plot data
-        x, y = self.reformat_scatter_data(self.rrcs_data)
+        x, y = self.reformat_scatter_data()
 
         filename = f"{os.path.splitext(self.output)[0]}_scatter.png"
 
         # Chart title, x-axis and y-axis labels
         title = "RRCS scatter plot"
-        xlabel = "Frame"
+        xlabel = "Time (ps)"
         ylabel = "RRCS Score"
 
         sns.set_theme(style="whitegrid")
@@ -509,13 +510,13 @@ class DataVisualizer:
 
     def plot_violin(self):
         """
-        Generate a violin plot for the RRCSS scores.
+        Generate a violin plot for the RRCS scores.
         
-        This method re-formats the RRCSS data, creates a violin plot using seaborn, and saves the plot as an image file.
+        This method re-formats the RRCS data, creates a violin plot using seaborn, and saves the plot as an image file.
         The violin plot shows the distribution of scores for the initial, middle, and final frames.
         """
-        # Reformatted scatter plot data
-        data = self.reformat_violin_data(self.rrcs_data)
+        # Reformatted violin plot data
+        data = self.reformat_violin_data()
 
         filename = f"{os.path.splitext(self.output)[0]}_violin.png"
 
@@ -544,52 +545,60 @@ class DataVisualizer:
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         logging.info(f"Violin plot saved to {filename}")
 
-    def reformat_scatter_data(self, rrcs_data):
+    def reformat_scatter_data(self):
         """
         Reformat scatter plot data.
 
-        Transforms the original data into (x, y) pairs suitable for plotting a scatter graph.
-        The raw data is a dictionary where keys are features and values are lists of multiple tuples,
-        each tuple containing a feature value, a metric, and a score.
-
-        Parameters:
-        rrcs_data: dict, the original dictionary of data.
+        Transforms the original data into (x, y) pairs suitable for plotting a scatter graph using times and all_frame_rrcs.
 
         Returns:
-        tuple, containing two lists: one for x-axis data and another for y-axis data.
+        tuple, containing two lists: one for x-axis data (times) and another for y-axis data (RRCS scores).
         """
-        # Using list comprehension to extract scores from the original data, forming a new list of tuples
-        data = [(f, s) for f, scores in sorted(rrcs_data.items(), key=lambda x: x[0]) for _, _, s in scores if s > 0]
+        # Using list comprehension to extract scores with corresponding times
+        data = [(self.times[i], s) for i, frame_rrcs in enumerate(self.all_frame_rrcs) for _, _, s in frame_rrcs if s > 0]
         x, y = zip(*data)
 
-        x = np.array([int(i) for i in x])
+        x = np.array([float(i) for i in x])
         y = np.array([float(i) for i in y])
 
         return x, y
     
-    def reformat_violin_data(self, rrcs_data):
+    def reformat_violin_data(self):
         """
         Reformat violin plot data.
         """
-        # Sort the keys of rrcs_data, which are time points, to facilitate the selection of initial, middle, and final time points
-        frames = sorted(rrcs_data.keys())
-        initial_index = frames[0]
-        middle_index = frames[len(frames) // 2]
-        final_index = frames[-1]
-
-        initial_frame = [float(s) for _, _, s in rrcs_data[initial_index] if s>0]
-        middle_frame = [float(s) for _, _, s in rrcs_data[middle_index] if s>0]
-        final_frame = [float(s) for _, _, s in rrcs_data[final_index] if s>0]
+        # Select initial, middle, and final frames
+        initial_frame = [float(s) for _, _, s in self.all_frame_rrcs[0] if s > 0]
+        middle_frame = [float(s) for _, _, s in self.all_frame_rrcs[len(self.all_frame_rrcs) // 2] if s > 0]
+        final_frame = [float(s) for _, _, s in self.all_frame_rrcs[-1] if s > 0]
 
         # Combine the data into a list
         return [initial_frame, middle_frame, final_frame]
+
+    def save_to_hdf5(self):
+        """
+        Saves the RRCS data to an HDF5 file, consistent with the reference code's format.
+
+        Creates an HDF5 file in the output directory with a group for each residue pair,
+        each containing 'times' and 'rrcs' datasets.
+        """
+        h5_filename = os.path.join(self.output_dir, os.path.splitext(self.basic_settings['output_file'])[0] + '.h5')
+        with h5py.File(h5_filename, 'w') as hf:
+            for j, pair in enumerate(self.basic_settings['res_pairs']):
+                group_name = f"{pair[0]}_{pair[1]}"
+                grp = hf.create_group(group_name)
+                grp.create_dataset('times', data=np.array(self.times))
+                scores = [self.all_frame_rrcs[i][j][2] for i in range(len(self.all_frame_rrcs))]
+                grp.create_dataset('rrcs', data=np.array(scores))
+        logging.info(f"HDF5 file saved to {h5_filename}")
 
     def run(self):
         """
         Executes the analysis and outputs the result.
 
-        If the plotting option is configured, it will draw a scatter plot first. 
-        Afterwards, regardless of whether plotting is done or not, it will write to the output file.
+        If the plotting option is configured, it will draw scatter and violin plots.
+        If save_hdf5 is specified, it will generate an HDF5 file.
+        Finally, it writes to the output file.
         """
         # Check if plotting is required
         if self.isplot:
@@ -597,9 +606,11 @@ class DataVisualizer:
             self.plot_scatter()
             # Draw a violin plot
             self.plot_violin()
+        # Generate HDF5 file if specified
+        if self.basic_settings['save_hdf5']:
+            self.save_to_hdf5()
         # Write to the output file
         self.write_output()
-
 
 class RRCSAnalyzer:
     def __init__(self):
@@ -826,15 +837,15 @@ class RRCSAnalyzer:
             for all frames.
         
         Returns:
-        frame_count : int
-            The count of the current frame.
+        frame_time : float
+            The time of the current frame in picoseconds.
         frame_rrcs : list
             A list of all calculated RRCS values for the current frame.
         """
         # Retrieve step information for the specified frame
         frame_step = md_traj.trajectory[frame_index]
         protein = md_traj.select_atoms("protein")
-        frame_count = frame_step.frame + 1
+        frame_time = frame_step.time  # Use time instead of frame count
         # Initialize the list for RRCS values of the current frame
         frame_rrcs = []
 
@@ -864,7 +875,7 @@ class RRCSAnalyzer:
                 else:
                     rrcs_score = 0
                 frame_rrcs.append((f"{chain_id}:{index_i}{res_i}", f"{chain_id}:{index_j}{res_j}", rrcs_score))
-        return frame_count, frame_rrcs
+        return frame_time, frame_rrcs
 
     @staticmethod
     def check_time_index(begin_index, end_index, step_index):
@@ -916,14 +927,17 @@ class RRCSAnalyzer:
             Configuration dictionary containing simulation trajectory and analysis parameters.
             
         Returns:
-        all_frame_rrcs: dict
-            Dictionary of residue-residue contact information for all frames.
+        times: list
+            List of frame times in picoseconds.
+        all_frame_rrcs: list
+            List where each element is a list of (res1, res2, rrcs_score) tuples for a frame.
         """
         # Start timing
         global_start = timeit.default_timer()
 
-        # Initialize dictionary to store residue-residue contact information for all frames
-        all_frame_rrcs = {}
+        # Initialize lists to store times and RRCS data
+        times = []
+        all_frame_rrcs = []
 
         # Obtain the molecular dynamics simulation trajectory
         md_traj = basic_settings['md_traj']
@@ -942,43 +956,35 @@ class RRCSAnalyzer:
         info_first = self.get_residue_info(protein, basic_settings['traj_chains'], member_first)
         info_second = self.get_residue_info(protein, basic_settings['traj_chains'], member_second)
 
-        # Prepare the arguments for the parallel processing tasks
-        args = []
-        for frame_index in range(begin_time_index, end_time_index+1, frequency_step_index):
-            args.append((frame_index, info_first, info_second, basic_settings, md_traj))
-
         n_cpus = basic_settings['num_processes']
         logging.info(f"Will use {n_cpus} cores for parallel computing.")
         if (n_cpus == None) or (n_cpus > 1):
             # Use the process pool executor for parallel processing
             with ProcessPoolExecutor(max_workers=n_cpus) as executor:
-                futures = [executor.submit(self.analyze_frame, *arg) for arg in args]
-
-                # Wait for all tasks to complete
-                wait(futures, return_when=ALL_COMPLETED)
-
-                # Iterate through the completed tasks, updating the contact information of all frames
-                for future in as_completed(futures):
-                    frame_count, frame_rrcs = future.result()
-                    all_frame_rrcs[frame_count] = frame_rrcs
-                    print_nstep_time(frame_count, global_start, basic_settings['print_freq'])
+                futures = [executor.submit(self.analyze_frame, frame_index, info_first, info_second, basic_settings, md_traj)
+                           for frame_index in range(begin_time_index, end_time_index+1, frequency_step_index)]
+                # Collect results in order of submission
+                results = [future.result() for future in futures]
+                times = [result[0] for result in results]
+                all_frame_rrcs = [result[1] for result in results]
         elif n_cpus <= 1:
             # Use serial processing when the number of CPUs is less than 1
             for frame_index in range(begin_time_index, end_time_index+1, frequency_step_index):
-                # Analyze a single frame
-                frame_count, frame_rrcs = self.analyze_frame(
+                frame_time, frame_rrcs = self.analyze_frame(
                     frame_index, 
                     info_first, 
                     info_second, 
                     basic_settings, 
                     md_traj)
-                all_frame_rrcs[frame_count] = frame_rrcs
-                # Prints the elapsed time at specified calculation steps.
-                print_nstep_time(frame_count, global_start, basic_settings['print_freq'])
+                times.append(frame_time)
+                all_frame_rrcs.append(frame_rrcs)
+                # Optional: Print progress (simplified)
+                if (len(times) % basic_settings['print_freq']) == 0:
+                    elapsed = timeit.default_timer() - global_start
+                    logging.info(f"Processed {len(times)} frames in {elapsed:.2f} seconds.")
         else:
             log_error("ValueTypeError", "The entered integer is invalid. Please enter a valid integer.")
-        return all_frame_rrcs
-
+        return times, all_frame_rrcs
 
 def run_pipline():
     """
@@ -997,11 +1003,10 @@ def run_pipline():
 
     # Create an analyzer instance to analyze the contact data in the simulation
     analyzer = RRCSAnalyzer()
-    all_frame_rrcs = analyzer.analyze_contacts(initializer.basic)
+    times, all_frame_rrcs = analyzer.analyze_contacts(initializer.basic)
 
     # Create a data visualizer instance and perform data visualization
-    DataVisualizer(initializer.basic, all_frame_rrcs).run()
-
+    DataVisualizer(initializer.basic, times, all_frame_rrcs).run()
 
 def main():
     """
@@ -1018,5 +1023,5 @@ def main():
 
 
 if __name__ == "__main__":
-
+    
     main()
